@@ -31,6 +31,13 @@ h2 { font-size: 15px; color: #9fb0cc; margin: 0 0 12px; text-transform: uppercas
 .state-draining { border-left: 4px solid #5b9cf5; }
 .state-draining .badge { background: rgba(91,156,245,.18); color: #5b9cf5; }
 .state-idle    { border-left: 4px solid #6b7689; }
+.state-offline { border-left: 4px solid #e04b41; }
+.state-offline .badge { background: rgba(224,75,65,.18); color: #ff7a70; }
+.mount-bad { color: #ff7a70; margin-top: 4px; }
+.mount-ok { color: #35d07f; margin-top: 4px; }
+button.danger { background: #a23530; }
+button.danger:hover { background: #c0413a; }
+button:disabled { opacity: .55; cursor: wait; }
 
 .bar { height: 8px; background: #0f1420; border-radius: 4px; overflow: hidden; margin-bottom: 6px; }
 .bar > div { height: 100%; background: linear-gradient(90deg, #3578d0, #5b9cf5); }

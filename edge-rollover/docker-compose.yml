@@ -3,8 +3,11 @@ services:
     build: .
     image: edge-rollover:latest
     container_name: edge-rollover
-    # loop 镜像挂载需要特权；若改用目录模式（USE_LOOP_IMAGES=0）可去掉 privileged
-    privileged: true
+    # 默认目录模式（USE_LOOP_IMAGES=0），无需特权，拔盘/错装直接用
+    # mv/cp 操作 /data/pN 目录即可模拟。
+    # 真机 loop 镜像模式启动：
+    #   USE_LOOP_IMAGES=1 PRIVILEGED=1 docker compose up -d --build
+    privileged: ${PRIVILEGED:-false}
     ports:
       - "8080:8080"
     environment:
@@ -14,7 +17,8 @@ services:
       PARTITION_COUNT: "3"
       ENABLE_TEST_HOOKS: "1"                  # 验收测试用；生产置 0
       DRAIN_POLL_INTERVAL: "2"
-      USE_LOOP_IMAGES: "1"                    # 无特权环境置 0 即降级为目录
+      # 0=普通目录（默认，便于模拟拔盘/错装）；1=loop 镜像+ext4（需 PRIVILEGED=1）
+      USE_LOOP_IMAGES: "${USE_LOOP_IMAGES:-0}"
     volumes:
       - rollover-data:/data
     restart: unless-stopped

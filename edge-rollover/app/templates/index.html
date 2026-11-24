@@ -75,7 +75,7 @@
 <script>
 const STATE_LABEL = {
   active: '写入区', sealed: '已封区', recycling: '回收中',
-  draining: '排空中', idle: '周转空闲'
+  draining: '排空中', idle: '周转空闲', offline: '离线检修'
 };
 
 function esc(s) {
@@ -93,7 +93,11 @@ function fmtTime(ts) {
 async function api(url, opts={}) {
   const r = await fetch(url, {headers:{'Accept':'application/json'}, ...opts});
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+  if (!r.ok) {
+    const err = new Error(data.error || ('HTTP ' + r.status));
+    Object.assign(err, data);
+    throw err;
+  }
   return data;
 }
 function flash(el, text, ok=true) {
@@ -108,19 +112,44 @@ async function render() {
   document.getElementById('partitions').innerHTML = ov.partitions.map(p => {
     const pct = p.capacity ? Math.round(100 * p.used / p.capacity) : 0;
     const actions = [];
-    if (p.state === 'sealed')
+    if (p.state === 'sealed') {
       actions.push(`<button onclick="recycle('${p.id}')">发起回收</button>`);
+      actions.push(`<button class="danger" onclick="offlineVol('${p.id}', ${p.active_downloads})">离线检修</button>`);
+    }
+    if (p.state === 'offline') {
+      actions.push(`<button ${p.verifying ? 'disabled' : ''} onclick="reattach('${p.id}')">
+        ${p.verifying ? '核验中…' : '装回原卷·接回核验'}</button>`);
+    }
     if (p.state === 'recycling') {
       actions.push(`<button onclick="retryRecycle('${p.id}')">重试回收</button>`);
       actions.push(`<button class="ghost" onclick="cleanup('${p.id}')">清理周转区</button>`);
     }
     if (p.state === 'draining')
       actions.push(`<button class="ghost" onclick="drain('${p.id}')">立即检查排空</button>`);
+
+    let mountLine = '';
+    if (p.state === 'offline' || p.mount_status !== 'ok' || !p.volume_match) {
+      if (p.mount_status === 'absent')
+        mountLine = `<div class="small mount-bad">⛔ 挂载路径不存在：卷已拔走/未装回</div>`;
+      else if (p.mount_status === 'no_identity' || p.mount_status === 'bad_identity')
+        mountLine = `<div class="small mount-bad">⛔ 当前挂载无有效卷标识（${esc(p.mount_status)}）：空挂载点或错盘</div>`;
+      else if (!p.volume_match)
+        mountLine = `<div class="small mount-bad">⛔ 卷标识不符：疑似错装卷 ${esc((p.mounted_volume_id||'').slice(0,12))}…</div>`;
+      else if (p.state === 'offline')
+        mountLine = `<div class="small mount-ok">✔ 已检测到原卷（待接回核验）</div>`;
+    }
+    const vid = p.volume_id ? `<span title="${esc(p.volume_id)}">卷标识 ${esc(p.volume_id.slice(0, 14))}…</span>` : '';
+    const timeLine = p.state === 'offline' && p.offline_at
+      ? `<div class="small">离线于 ${fmtTime(p.offline_at)} · 重启仍保持离线${p.verified_at ? ' · 上次核验 ' + fmtTime(p.verified_at) : ''}</div>`
+      : (p.verified_at ? `<div class="small">上次接回核验 ${fmtTime(p.verified_at)}</div>` : '');
     return `<div class="card state-${p.state}">
       <div class="card-head"><b>${p.id}</b><span class="badge">${STATE_LABEL[p.state]||p.state}</span></div>
       <div class="bar"><div style="width:${pct}%"></div></div>
       <div class="small">已用 ${fmtSize(p.used)} / ${fmtSize(p.capacity)}（${pct}%）</div>
       <div class="small">录像 ${p.recording_count} 个 · 在途下载 ${p.active_downloads} 个</div>
+      <div class="small mono">${vid}</div>
+      ${timeLine}
+      ${mountLine}
       ${p.last_error ? `<div class="err small">错误：${esc(p.last_error)}</div>` : ''}
       <div class="row wrap actions">${actions.join('')}</div>
     </div>`;
@@ -166,6 +195,38 @@ window.recycle = async (pid) => {
   render();
 };
 window.retryRecycle = (pid) => window.recycle(pid);
+window.offlineVol = async (pid, activeDownloads) => {
+  // 不使用原生 confirm：服务端对“必须 sealed 且无在途下载”有最终原子判定，
+  // 若下载/回收先获准，错误原因会直接展示在这里（也便于无头浏览器验收）。
+  const msg = document.getElementById('op-msg');
+  if (activeDownloads > 0) {
+    flash(msg, `${pid} 当前有 ${activeDownloads} 个在途下载，仍请求离线：若下载先获准会被服务端驳回`, false);
+  } else {
+    flash(msg, `正在将 ${pid} 置为离线…`);
+  }
+  try {
+    await api(`/api/partitions/${pid}/offline`, {method:'POST'});
+    flash(msg,
+      `${pid} 已离线，可以拆卷检修；离线期间拒绝新下载与回收，重启仍保持；` +
+      `装回后请点“装回原卷·接回核验”`);
+  } catch (e) { flash(msg, e.message, false); }
+  render();
+};
+window.reattach = async (pid) => {
+  const msg = document.getElementById('op-msg');
+  flash(msg, `正在核验 ${pid} 卷标识与全部登记录像…（期间其他分区照常读写）`);
+  try {
+    const r = await api(`/api/partitions/${pid}/reattach`, {method:'POST'});
+    flash(msg,
+      `${pid} 原卷接回成功：${r.checked} 条录像、${fmtSize(r.total_bytes)} ` +
+      `大小与摘要全部相符，已恢复封区、原下载链接与回收`);
+  } catch (e) {
+    const rep = e && e.report ? e.report : null;
+    const n = rep && rep.failures ? rep.failures.length : 0;
+    flash(msg, `接回核验失败，${pid} 保持离线：${e.message}` + (n ? `（${n} 条不符）` : ''), false);
+  }
+  render();
+};
 window.cleanup = async (pid) => {
   try {
     const r = await api(`/api/partitions/${pid}/cleanup`, {method:'POST'});

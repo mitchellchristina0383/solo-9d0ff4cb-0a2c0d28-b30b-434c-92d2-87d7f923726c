@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import os
 import sqlite3
 import threading
 import time
@@ -22,11 +23,14 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS partitions (
     id              TEXT PRIMARY KEY,
     seq             INTEGER NOT NULL,
-    state           TEXT NOT NULL,              -- active/sealed/recycling/draining/idle
+    state           TEXT NOT NULL,              -- active/sealed/recycling/draining/idle/offline
     capacity        INTEGER NOT NULL,
     mount_path      TEXT NOT NULL,
     image_path      TEXT,
+    volume_id       TEXT,                       -- 卷上持久标识（<mount>/.rollover-volume.json）
     last_error      TEXT,
+    offline_at      REAL,                       -- 进入 offline 的时间（重启后据此保持离线）
+    verified_at     REAL,                       -- 最近一次接回核验通过时间
     created_at      REAL NOT NULL,
     updated_at      REAL NOT NULL
 );
@@ -73,12 +77,14 @@ CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 
 def init_db(db_path: str) -> None:
     global _conn
+    os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
     _conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30)
     _conn.row_factory = sqlite3.Row
     _conn.execute("PRAGMA journal_mode=WAL")
     _conn.execute("PRAGMA foreign_keys=ON")
     with _LOCK:
         _conn.executescript(SCHEMA)
+        _migrate(_conn)
         # 进程重启后，残留的 active 下载连接已随进程死亡，标记为 interrupted
         _conn.execute(
             "UPDATE downloads SET status='interrupted', ended_at=? "
@@ -86,6 +92,19 @@ def init_db(db_path: str) -> None:
             (time.time(),),
         )
         _conn.commit()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对旧版本库做幂等列迁移（CREATE TABLE IF NOT EXISTS 不会补列）。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(partitions)")}
+    additions = {
+        "volume_id": "ALTER TABLE partitions ADD COLUMN volume_id TEXT",
+        "offline_at": "ALTER TABLE partitions ADD COLUMN offline_at REAL",
+        "verified_at": "ALTER TABLE partitions ADD COLUMN verified_at REAL",
+    }
+    for name, ddl in additions.items():
+        if name not in cols:
+            conn.execute(ddl)
 
 
 def db() -> sqlite3.Connection:
@@ -171,6 +190,39 @@ def set_partition_error(pid: str, error: Optional[str]) -> None:
         db().execute(
             "UPDATE partitions SET last_error=?, updated_at=? WHERE id=?",
             (error, time.time(), pid),
+        )
+        db().commit()
+
+
+def set_partition_volume_id(pid: str, volume_id: str) -> None:
+    with _LOCK:
+        db().execute(
+            "UPDATE partitions SET volume_id=?, updated_at=? WHERE id=?",
+            (volume_id, time.time(), pid),
+        )
+        db().commit()
+
+
+def mark_partition_offline(pid: str) -> None:
+    """状态置 offline 并记录时间；该状态写入 SQLite，重启后仍然保持。"""
+    now = time.time()
+    with _LOCK:
+        db().execute(
+            "UPDATE partitions SET state='offline', offline_at=?, "
+            "last_error=NULL, updated_at=? WHERE id=?",
+            (now, now, pid),
+        )
+        db().commit()
+
+
+def mark_partition_reattached(pid: str) -> None:
+    """核验通过后恢复为 sealed（离线只允许从 sealed 进入）。"""
+    now = time.time()
+    with _LOCK:
+        db().execute(
+            "UPDATE partitions SET state='sealed', verified_at=?, "
+            "last_error=NULL, updated_at=? WHERE id=?",
+            (now, now, pid),
         )
         db().commit()
 

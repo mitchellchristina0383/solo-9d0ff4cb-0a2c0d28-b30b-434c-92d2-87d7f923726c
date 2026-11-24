@@ -56,16 +56,12 @@ def create_app() -> Flask:
 
     # ---------------- 下载 ----------------
     def _stream_file(path: str, token: str, partition_id: str,
-                     start: int = 0, end: int | None = None,
-                     delay: float = 0.0):
+                     start: int, end: int, delay: float = 0.0):
         """分块流式输出，全程登记为该分区上的活动下载。
 
         客户端中途断开也会被 finally 捕获，登记为 interrupted；
-        已读完的字节照常计数。
+        已读完的字节照常计数。start/end 已由路由按文件大小算好。
         """
-        file_size = os.path.getsize(path)
-        if end is None or end >= file_size:
-            end = file_size - 1
         remaining = end - start + 1
 
         def generate():
@@ -74,13 +70,15 @@ def create_app() -> Flask:
                 with open(path, "rb") as fh:
                     fh.seek(start)
                     while sent < remaining:
+                        # 节流放在取块/发送之前：最后一个字节 yield 之后
+                        # 不再有额外停顿，客户端读完时 token 会很快收尾。
+                        if delay:
+                            time.sleep(delay)
                         chunk = fh.read(min(storage.CHUNK, remaining - sent))
                         if not chunk:
                             break
                         yield chunk
                         sent += len(chunk)
-                        if delay:
-                            time.sleep(delay)
             finally:
                 status = "finished" if sent >= remaining else "interrupted"
                 db.finish_download(token, sent, status)
@@ -89,11 +87,16 @@ def create_app() -> Flask:
     @app.get("/api/recordings/<rid>/download")
     def api_download(rid):
         try:
-            rec, part, path = service.resolve_for_download(rid)
+            rec, part, path, token = service.admit_download(rid)
         except service.ServiceError as exc:
             return jsonify({"error": str(exc)}), 409
 
-        file_size = os.path.getsize(path)
+        try:
+            file_size = os.path.getsize(path)
+        except OSError as exc:
+            db.finish_download(token, 0, "interrupted")
+            return jsonify({"error": f"录像文件不可读: {exc}"}), 409
+
         range_header = request.headers.get("Range")
         start, end = 0, file_size - 1
         status_code = 200
@@ -110,10 +113,10 @@ def create_app() -> Flask:
                 end = min(end, file_size - 1)
                 status_code = 206
             except ValueError:
+                # 准入时已登记 token：参数非法不传输，注销活动计数
+                db.finish_download(token, 0, "interrupted")
                 return jsonify({"error": "非法的 Range 头"}), 416
 
-        # 在途下载登记：记录读取时的物理分区，该分区在计数归零前不会被清空
-        token = db.open_download(rid, part["id"])
         delay = 0.0
         if Config.ENABLE_TEST_HOOKS:
             delay = request.args.get("slow", default=0.0, type=float)
@@ -145,6 +148,27 @@ def create_app() -> Flask:
             result = service.seal_active()
         except service.ServiceError as exc:
             return jsonify({"error": str(exc)}), 409
+        return jsonify(result)
+
+    @app.post("/api/partitions/<pid>/offline")
+    @app.post("/api/partitions/<pid>/eject")
+    def api_offline(pid):
+        try:
+            result = service.offline_partition(pid)
+        except service.ServiceError as exc:
+            return jsonify({"error": str(exc), **exc.payload}), 409
+        return jsonify(result)
+
+    # “接回”的命名兼容：reattach（主）/ online / attach 等价
+    @app.post("/api/partitions/<pid>/reattach")
+    @app.post("/api/partitions/<pid>/online")
+    @app.post("/api/partitions/<pid>/attach")
+    def api_reattach(pid):
+        try:
+            result = service.reattach_partition(pid)
+        except service.ServiceError as exc:
+            # 核验失败属预期业务结果：409 + 结构化报告，分区保持 offline
+            return jsonify({"error": str(exc), **exc.payload}), 409
         return jsonify(result)
 
     @app.post("/api/partitions/<pid>/recycle")
@@ -186,6 +210,19 @@ def create_app() -> Flask:
         @app.post("/api/test/reset-fail")
         def api_reset_fail():
             storage.reset_failure()
+            return jsonify(storage.failure_config())
+
+        @app.post("/api/test/verify-delay")
+        def api_verify_delay():
+            body = request.get_json(silent=True) or {}
+            seconds = body.get("seconds", 0.0)
+            try:
+                seconds = float(seconds)
+            except (TypeError, ValueError):
+                return jsonify({"error": "seconds 必须是数字"}), 400
+            storage.configure_verify_delay(seconds)
+            db.log_event("warn", "test_hook",
+                         f"注入接回核验延迟：每个录像文件前停顿 {seconds} 秒")
             return jsonify(storage.failure_config())
 
     @app.errorhandler(413)

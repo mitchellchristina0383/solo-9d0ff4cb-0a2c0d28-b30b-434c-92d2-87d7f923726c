@@ -13,11 +13,17 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
+import time
 from typing import Optional
 
 CHUNK = 1024 * 1024  # 1 MiB
+
+# 卷根目录上的持久标识文件：loop 镜像里它在 ext4 文件系统上，随卷走；
+# 目录模式模拟拔盘/错装时，整个目录 mv/cp 也会带上/替换掉它。
+VOLUME_ID_FILENAME = ".rollover-volume.json"
 
 # ---- 故障注入（仅 ENABLE_TEST_HOOKS=1 时生效）----
 # move_fail_after: 本次回收累计搬移写入多少字节后抛 IOError
@@ -25,19 +31,36 @@ CHUNK = 1024 * 1024  # 1 MiB
 _FAIL_FLAGS = {"move_fail_after": None}
 _MOVE_BYTES = 0  # 全局累计：一次回收周期内所有 copy_with_verify 的写入量
 
+# 接回核验时每个录像文件前的额外停顿（秒），用于确定性地观察
+# “核验期间其他分区照常读写”，仅测试钩子开启时可设置。
+_VERIFY_DELAY = 0.0
+
 
 def configure_failure(move_fail_after: Optional[int] = None) -> None:
     _FAIL_FLAGS["move_fail_after"] = move_fail_after
 
 
+def configure_verify_delay(seconds: float = 0.0) -> None:
+    global _VERIFY_DELAY
+    _VERIFY_DELAY = max(0.0, float(seconds or 0.0))
+
+
+def maybe_verify_sleep() -> None:
+    if _VERIFY_DELAY:
+        time.sleep(_VERIFY_DELAY)
+
+
 def failure_config() -> dict:
-    return dict(_FAIL_FLAGS)
+    cfg = dict(_FAIL_FLAGS)
+    cfg["verify_delay_seconds"] = _VERIFY_DELAY
+    return cfg
 
 
 def reset_failure() -> None:
     global _MOVE_BYTES
     _FAIL_FLAGS["move_fail_after"] = None
     _MOVE_BYTES = 0
+    configure_verify_delay(0.0)
 
 
 def reset_move_counter() -> None:
@@ -73,6 +96,81 @@ def abs_path(mount_path: str, relpath: str) -> str:
 def ensure_partition_dirs(mount_path: str) -> None:
     for sub in ("recordings", "staging", "moved"):
         os.makedirs(os.path.join(mount_path, sub), exist_ok=True)
+
+
+# ---------------- 卷持久标识 / 接回核验 ----------------
+
+def volume_identity_path(mount_path: str) -> str:
+    return os.path.join(mount_path, VOLUME_ID_FILENAME)
+
+
+def write_volume_identity(mount_path: str, partition_id: str,
+                          volume_id: str) -> str:
+    """在卷根写入持久标识（原子替换 + fsync）。"""
+    os.makedirs(mount_path, exist_ok=True)
+    path = volume_identity_path(mount_path)
+    tmp = path + ".tmp"
+    payload = {
+        "kind": "edge-rollover-volume",
+        "volume_id": volume_id,
+        "partition_id": partition_id,
+        "created_at": time.time(),
+    }
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    return path
+
+
+def probe_volume(mount_path: str) -> tuple[str, Optional[dict]]:
+    """探测当前挂载路径上的卷。
+
+    返回 (status, identity)：
+      - ("ok", {...})            目录存在且标识文件合法
+      - ("absent", None)         挂载路径不存在（卷没装回/挂载点缺失）
+      - ("no_identity", None)    目录在但没有标识文件（空挂载点/未格式化/被清空）
+      - ("bad_identity", None)   标识文件损坏或缺少 volume_id
+    """
+    if not os.path.isdir(mount_path):
+        return "absent", None
+    path = volume_identity_path(mount_path)
+    if not os.path.isfile(path):
+        return "no_identity", None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        vid = data.get("volume_id") if isinstance(data, dict) else None
+        if not isinstance(vid, str) or not vid:
+            return "bad_identity", None
+        return "ok", data
+    except (OSError, ValueError):
+        return "bad_identity", None
+
+
+def check_recording_file(abs_path: str, expected_size: int,
+                         expected_sha256: str) -> Optional[str]:
+    """核对单条登记录像：存在性、大小、sha256 摘要。
+
+    通过返回 None，否则返回可展示的失败原因。
+    """
+    if not os.path.isfile(abs_path):
+        return "登记文件在卷上不存在"
+    try:
+        actual_size = os.path.getsize(abs_path)
+    except OSError as exc:
+        return f"无法读取文件大小: {exc}"
+    if actual_size != expected_size:
+        return f"大小不符（登记 {expected_size} 字节，卷上 {actual_size} 字节）"
+    try:
+        actual_sha = sha256_file(abs_path)
+    except OSError as exc:
+        return f"摘要读取失败: {exc}"
+    if actual_sha != expected_sha256:
+        return (f"sha256 摘要不符（登记 {expected_sha256[:16]}…，"
+                f"实算 {actual_sha[:16]}…）")
+    return None
 
 
 def sha256_file(path: str) -> str:
